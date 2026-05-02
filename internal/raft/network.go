@@ -1,53 +1,43 @@
-// internal/raft/network.go
 package raft
 
 import (
 	"fmt"
-	"log" //system monitoring and safe crashing(kill switch)
-
-	// for debugging needed to attached time stamps
-	"net"     //hardware level operating system communication
-	"net/rpc" //we use remote procedure calls
+	"log"
+	"net"
+	"net/rpc"
 )
 
-func (rf *Raft) callRequestVote(peer int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	// Connect to peer
-	address := fmt.Sprintf("localhost:%d", 8000+peer)
-	client, err := rpc.Dial("tcp", address)
-	if err != nil {
-		return false
-	}
-	//limited resources, so i have to close
-	//limited file descriptors
-	//only allowed 1024 ports open on a mac at once
-	defer client.Close()
-
-	// Call RPC
-	err = client.Call("Raft.RequestVote", args, reply)
-	return err == nil
-}
-
-//concurrent network listener
-//making our nodes active servers on the network
-
-// Start RPC server
-// have to make this public because my test module is external
-// and needs to call this public function
+// Serve starts an isolated RPC server for this node on port 8000+id.
+//
+// ── BUG 2 FIX ────────────────────────────────────────────────────────────────
+// The original code called the package-level rpc.Register(rf), which writes
+// into a single global registry keyed on the type name "Raft". The second
+// and third calls silently fail (rpc.Register returns an error that was
+// ignored), so all inbound RPCs — on all three ports — were dispatched to
+// whichever Raft struct was registered first (node 0).
+//
+// This explains the test log lines like:
+//
+//	[Node 0] Received RequestVote from 2 for term 1   ← appears twice
+//
+// Node 2's vote request to peer 0 and to peer 1 both landed on node 0's
+// handler because peer 1's port (8001) was also using node 0's registered
+// handler. It also explains the term contamination between test runs, since
+// the stale global registry carried node 0's term=4 from TestElection into
+// TestLeaderFailure, causing the immediate jump to term 5.
+//
+// Fix: use rpc.NewServer() to get a fresh, isolated registry per node.
+// ─────────────────────────────────────────────────────────────────────────────
 func (rf *Raft) Serve() {
+	server := rpc.NewServer()
+	if err := server.Register(rf); err != nil {
+		log.Fatalf("[Node %d] RPC registration failed: %v", rf.id, err)
+	}
 
-	//we need to register what a raft is
-	//remote procedures is blind by default
-	//scans the memory block associated with rf
-	// all methods beginning with a capital letter
-	// attached to our rf are made avaiable to be
-	// triggered by oncoming network traffic
-	server := rpc.NewServer() // isolated, not global
-	server.Register(rf)
 	l, err := net.Listen("tcp", fmt.Sprintf(":%d", 8000+rf.id))
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("[Node %d] Failed to listen on port %d: %v", rf.id, 8000+rf.id, err)
 	}
-
 	rf.listener = l
 
 	log.Printf("[Node %d] RPC server started on port %d", rf.id, 8000+rf.id)
@@ -56,14 +46,34 @@ func (rf *Raft) Serve() {
 		for {
 			conn, err := rf.listener.Accept()
 			if err != nil {
-				continue
+				// Any error here means the listener was closed by Stop().
+				// The original code used `continue` here, which spins forever
+				// on a closed listener — a CPU-burning goroutine leak.
+				return
 			}
 			go server.ServeConn(conn)
 		}
 	}()
 }
 
-//we thread here, we use a go function in order to
-//run a infinite loop on a different thread so it doesnt
-//affect our main program
-// we also use a go command to make multiple connection channels
+// callRequestVote dials peer and invokes the RequestVote RPC.
+// Returns false on any network or RPC error (treated as "no vote").
+func (rf *Raft) callRequestVote(peer int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	client, err := rpc.Dial("tcp", fmt.Sprintf("localhost:%d", 8000+peer))
+	if err != nil {
+		return false
+	}
+	defer client.Close()
+	return client.Call("Raft.RequestVote", args, reply) == nil
+}
+
+// callAppendEntries dials peer and invokes the AppendEntries RPC.
+// Returns false on any network or RPC error.
+func (rf *Raft) callAppendEntries(peer int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	client, err := rpc.Dial("tcp", fmt.Sprintf("localhost:%d", 8000+peer))
+	if err != nil {
+		return false
+	}
+	defer client.Close()
+	return client.Call("Raft.AppendEntries", args, reply) == nil
+}

@@ -1,6 +1,3 @@
-// constructor, allocate a new Raft and initialize fields
-// start the timer
-// return a ready to use node
 package raft
 
 import (
@@ -9,8 +6,9 @@ import (
 	"time"
 )
 
-func NewRaft(id int, peers []int) *Raft {
+// ─── Construction ────────────────────────────────────────────────────────────
 
+func NewRaft(id int, peers []int) *Raft {
 	rf := &Raft{
 		id:    id,
 		state: Follower,
@@ -26,140 +24,222 @@ func NewRaft(id int, peers []int) *Raft {
 		applyCh:    make(chan LogEntry, 100),
 		nextIndex:  make(map[int]int),
 		matchIndex: make(map[int]int),
+
+		stopCh: make(chan struct{}), // buffered is not needed; close() is the signal
 	}
 
-	// Start election timer
 	rf.resetElectionTimer()
-
 	return rf
 }
 
+// ─── Election timer ───────────────────────────────────────────────────────────
+
+// resetElectionTimer restarts the countdown that triggers a new election.
+// Must be called while holding rf.mu, except in NewRaft (no contention yet).
 func (rf *Raft) resetElectionTimer() {
-	// Random timeout between 150-300ms (as per Raft paper)
-	//ensure Go.120 or newer because older versions of Go produced
-	//same sequence of random numbers
-	//if this happens i need to look into seeding servers
+	// 150–300 ms matches the range recommended in the Raft paper.
+	// Randomisation is what makes simultaneous split-votes unlikely.
 	timeout := time.Duration(150+rand.Intn(150)) * time.Millisecond
 
 	if rf.electionTimer != nil {
 		rf.electionTimer.Stop()
 	}
-
-	rf.electionTimer = time.AfterFunc(timeout, func() {
-		rf.startElection()
-	})
+	rf.electionTimer = time.AfterFunc(timeout, rf.startElection)
 }
+
+// ─── Leader election ──────────────────────────────────────────────────────────
 
 func (rf *Raft) startElection() {
 	rf.mu.Lock()
-	defer rf.mu.Unlock() //defer means as soon as this function ends
-	//thne we unlock
-	//cleaner code and easier to debug, say we had multiple if statements and they all returned
-	//we would then need to ensure unlock is in every branch and also we may miss one
-	//more lines of code and error prone
 
-	// Convert to candidate
+	// If Stop() was already called, do not start a new election.
+	select {
+	case <-rf.stopCh:
+		rf.mu.Unlock()
+		return
+	default:
+	}
+
 	rf.state = Candidate
 	rf.currentTerm++
 	rf.votedFor = rf.id
 
-	log.Printf("[Node %d] Starting election for term %d", rf.id, rf.currentTerm)
+	// Snapshot everything the goroutines will need *before* releasing the
+	// lock. This avoids holding the lock across RPC calls (which block)
+	// and makes each goroutine self-contained.
+	term := rf.currentTerm
+	id := rf.id
+	lastLogIndex := len(rf.log) - 1
+	lastLogTerm := rf.getLastLogTerm()
+	peers := append([]int{}, rf.peers...) // defensive copy
 
-	// Vote for self
-	votesReceived := 1
-
-	// Request votes from all peers
-	for _, peer := range rf.peers {
-		go rf.sendRequestVote(peer, &votesReceived)
-	}
-
-	// Reset election timer
 	rf.resetElectionTimer()
-}
-
-func (rf *Raft) sendRequestVote(peer int, votesReceived *int) {
-
-	rf.mu.Lock()
-	//not a reference yet, keep variables local until used
-	//across the network good go practice
-
-	args := RequestVoteArgs{
-		Term:         rf.currentTerm,
-		CandidateId:  rf.id,
-		LastLogIndex: len(rf.log) - 1,
-		LastLogTerm:  rf.getLastLogTerm(),
-		//im going to create a helper here incase log is empty
-		//if log empty, lastLogIndex will return -1 which is okay
-		//if log was empty last log term would try access
-		//-1 of the array which will cause a panic error
-		//so in need of a helper function
-	}
 	rf.mu.Unlock()
 
-	reply := RequestVoteReply{} //empty struct to hold the reply from peer
+	log.Printf("[Node %d] Starting election for term %d", id, term)
 
-	//if they reply given our arguments and fill in the form
-	//then we handle that reply(whether we was granted a vote) with our current votes(calculation)
-	if rf.callRequestVote(peer, &args, &reply) {
-		rf.handleVoteReply(&reply, votesReceived)
+	// votes is a shared counter, but it is always accessed while holding
+	// rf.mu, so no atomic operations are needed.
+	votes := 1
+	majority := len(peers)/2 + 1 // e.g. 2 for a 3-node cluster
+
+	for _, peer := range peers {
+		go func(p int) {
+			args := RequestVoteArgs{
+				Term:         term,
+				CandidateId:  id,
+				LastLogIndex: lastLogIndex,
+				LastLogTerm:  lastLogTerm,
+			}
+			reply := RequestVoteReply{}
+
+			if !rf.callRequestVote(p, &args, &reply) {
+				return
+			}
+
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+
+			// Seeing a higher term means someone else has moved on — step down.
+			if reply.Term > rf.currentTerm {
+				rf.currentTerm = reply.Term
+				rf.state = Follower
+				rf.votedFor = -1
+				rf.resetElectionTimer()
+				return
+			}
+
+			// Stale reply: we've already moved to a different term or state
+			// (e.g. another candidate beat us, or we already became leader).
+			if rf.state != Candidate || rf.currentTerm != term {
+				return
+			}
+
+			if reply.VoteGranted {
+				votes++
+				// Guard against calling becomeLeader() more than once if
+				// several replies arrive in quick succession (both see votes
+				// cross the threshold before state flips to Leader).
+				if votes >= majority && rf.state == Candidate {
+					rf.becomeLeader()
+				}
+			}
+		}(peer)
 	}
-
 }
 
-func (rf *Raft) handleVoteReply(reply *RequestVoteReply, votesReceived *int) {
-
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	//we know the reciever has a higher term, step down
-	if reply.Term > rf.currentTerm {
-		rf.currentTerm = reply.Term
-		rf.state = Follower
-		rf.votedFor = -1
-		return
-	}
-
-	//ensure were still in the candidate state
-	if rf.state != Candidate {
-		return
-	}
-
-	//checkk if we have majority then become leader
-	if reply.VoteGranted {
-
-		*votesReceived++
-
-		majority := len(rf.peers)/2 + 1
-		if *votesReceived >= majority {
-			rf.becomeLeader()
-
-		}
-	}
-}
-
-//we dont lock here
-//in go mutexes are non reentrant, meaning if a thread already has access
-//to a resource and tries to lock it again, the server instantly freezes
-
+// becomeLeader transitions the node to the Leader state.
+// Must be called while holding rf.mu.
 func (rf *Raft) becomeLeader() {
-
+	// ── BUG 3 FIX ─────────────────────────────────────────────────────────
+	// Without this, the election timer fires again while we are leader,
+	// bumps the term, and tears down the very election we just won.
 	rf.electionTimer.Stop()
-	log.Printf("[Node %d] Became leader for term %d", rf.id, rf.currentTerm)
-	rf.state = Leader
 
-	// Initialize leader state
+	rf.state = Leader
+	log.Printf("[Node %d] Became leader for term %d", rf.id, rf.currentTerm)
+
 	for _, peer := range rf.peers {
 		rf.nextIndex[peer] = len(rf.log)
 		rf.matchIndex[peer] = 0
 	}
-	// Start sending heartbeats
-	rf.sendHeartbeats()
+
+	// Launch the heartbeat goroutine tagged with the current term so that
+	// it exits automatically if this node steps down into a later term.
+	go rf.heartbeatLoop(rf.currentTerm)
 }
 
-// go standard RPC library has a strict unbreakable rule
-// A RPC handler can only take exactly two arguments
-// a pointer to the data(args)
-// a pointer to the response
+// ─── Heartbeats ───────────────────────────────────────────────────────────────
+
+// heartbeatLoop sends empty AppendEntries to all peers every 50 ms for as
+// long as this node remains leader in the given term.
+//
+// ── BUG 1 FIX ──────────────────────────────────────────────────────────────
+// The original sendHeartbeats() was an empty stub. Without heartbeats,
+// followers never hear from the leader, their election timers fire, and they
+// start a new election — producing multiple simultaneous leaders.
+func (rf *Raft) heartbeatLoop(term int) {
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-rf.stopCh:
+			return
+		case <-ticker.C:
+			rf.mu.Lock()
+			// Stop if we are no longer the leader, or no longer in this term.
+			if rf.state != Leader || rf.currentTerm != term {
+				rf.mu.Unlock()
+				return
+			}
+			peers := append([]int{}, rf.peers...)
+			leaderID := rf.id
+			rf.mu.Unlock()
+
+			for _, peer := range peers {
+				go rf.sendHeartbeat(peer, term, leaderID)
+			}
+		}
+	}
+}
+
+// sendHeartbeat sends a single empty AppendEntries RPC to one peer and handles
+// the reply. If the peer reports a higher term, this node steps back down to
+// follower.
+func (rf *Raft) sendHeartbeat(peer, term, leaderID int) {
+	args := AppendEntriesArgs{
+		Term:     term,
+		LeaderId: leaderID,
+	}
+	reply := AppendEntriesReply{}
+
+	if !rf.callAppendEntries(peer, &args, &reply) {
+		return
+	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if reply.Term > rf.currentTerm {
+		rf.currentTerm = reply.Term
+		rf.state = Follower
+		rf.votedFor = -1
+		rf.resetElectionTimer()
+	}
+}
+
+// ─── RPC handlers ─────────────────────────────────────────────────────────────
+
+// AppendEntries handles incoming AppendEntries RPCs (heartbeats and, later,
+// real log entries). Currently implements the heartbeat path only; full log
+// replication logic belongs in Phase 2.
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) error {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	reply.Term = rf.currentTerm
+	reply.Success = false
+
+	// Reject messages from stale leaders.
+	if args.Term < rf.currentTerm {
+		return nil
+	}
+
+	// Valid contact from a current or newer leader.
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
+	}
+
+	rf.state = Follower
+	rf.resetElectionTimer() // critical: this is what keeps followers alive
+	reply.Success = true
+	return nil
+}
+
+// RequestVote handles incoming RequestVote RPCs.
+// Go's net/rpc requires the handler signature: (args *T, reply *U) error.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) error {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -170,73 +250,78 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) erro
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
 
-	// If candidate's term is less than ours, reject
+	// Candidate is behind us — reject.
 	if args.Term < rf.currentTerm {
 		return nil
 	}
 
-	// If candidate's term is greater, update our term
+	// Candidate is ahead — update our term and become a fresh follower.
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.state = Follower
 		rf.votedFor = -1
 	}
 
-	// Grant vote if:
-	// 1. Haven't voted yet OR already voted for this candidate
-	// 2. Candidate's log is at least as up-to-date as ours
+	// Grant the vote only if:
+	//   1. We haven't voted yet (or already voted for this candidate), AND
+	//   2. The candidate's log is at least as up-to-date as ours.
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) &&
 		rf.isLogUpToDate(args.LastLogIndex, args.LastLogTerm) {
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
-		rf.resetElectionTimer() // Reset timer when granting vote
+		rf.resetElectionTimer()
 
 		log.Printf("[Node %d] Granted vote to %d for term %d",
 			rf.id, args.CandidateId, args.Term)
 	}
-	return nil
-	//Gos network library will refuse to attach a requestVote
-	//to the network if the rpc does not have a exact syntax
 
+	return nil
 }
 
+// isLogUpToDate returns true if the candidate's log is at least as
+// up-to-date as ours, using the Raft paper's definition (§5.4.1):
+//   - higher last term wins; ties broken by longer log.
+//
+// Callers must hold rf.mu.
 func (rf *Raft) isLogUpToDate(candidateIndex, candidateTerm int) bool {
 	lastIndex := len(rf.log) - 1
 	lastTerm := rf.getLastLogTerm()
-
-	// Candidate's log is more up-to-date if:
-	// 1. Last term is higher, OR
-	// 2. Same term but longer log
 	return candidateTerm > lastTerm ||
 		(candidateTerm == lastTerm && candidateIndex >= lastIndex)
 }
 
-// stubs to get my test working
-// STUB: Returns the term of the last entry in the log
-func (rf *Raft) getLastLogTerm() int {
-	// For now, just return 0 to satisfy the compiler
-	return 0
-}
+// ─── Test hooks ───────────────────────────────────────────────────────────────
 
-// STUB: Blasts empty AppendEntries to all peers to maintain Leadership
-func (rf *Raft) sendHeartbeats() {
-	// We will write the heartbeat loop here later
-}
-
-// GetState is a test hook to safely read the node's current status
-func (rf *Raft) GetState() NodeState { // (Assuming you named your state type 'State')
+// GetState safely returns the node's current state.
+func (rf *Raft) GetState() NodeState {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	return rf.state
 }
 
-// Stop is a test hook to simulate a hardware failure/crash
+// Stop shuts this node down cleanly:
+//   - resets state to Follower so a stopped node never appears as a leader
+//     in the test harness's final count
+//   - signals all background goroutines to exit via stopCh
+//   - kills the election timer
+//   - closes the network listener
 func (rf *Raft) Stop() {
-	if rf.listener != nil {
-		rf.listener.Close() // Cuts the network
-	}
+	// Flip to Follower before anything else so that GetState() called
+	// concurrently never sees a stale Leader on a stopped node.
+	rf.mu.Lock()
+	rf.state = Follower
+	rf.mu.Unlock()
+
+	// stopOnce prevents a double-close panic if Stop() is called twice
+	// (the test cleanup functions do exactly this).
+	rf.stopOnce.Do(func() {
+		close(rf.stopCh)
+	})
 
 	if rf.electionTimer != nil {
-		rf.electionTimer.Stop() // Kills the zombie background thread!
+		rf.electionTimer.Stop()
+	}
+	if rf.listener != nil {
+		rf.listener.Close()
 	}
 }
