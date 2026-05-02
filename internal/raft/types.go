@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"net"
 	"sync"
 	"time"
 )
@@ -9,6 +10,8 @@ type Raft struct {
 
 	//prevent race condition
 	mu sync.Mutex //need a lock for individual nodes
+
+	listener net.Listener //remember the network port opened
 
 	//node specific info
 	id    int

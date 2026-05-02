@@ -3,9 +3,11 @@ package raft
 
 import (
 	"fmt"
-	"log"
-	"net"
-	"net/rpc"
+	"log" //system monitoring and safe crashing(kill switch)
+
+	// for debugging needed to attached time stamps
+	"net"     //hardware level operating system communication
+	"net/rpc" //we use remote procedure calls
 )
 
 func (rf *Raft) callRequestVote(peer int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
@@ -29,7 +31,9 @@ func (rf *Raft) callRequestVote(peer int, args *RequestVoteArgs, reply *RequestV
 //making our nodes active servers on the network
 
 // Start RPC server
-func (rf *Raft) serve() {
+// have to make this public because my test module is external
+// and needs to call this public function
+func (rf *Raft) Serve() {
 
 	//we need to register what a raft is
 	//remote procedures is blind by default
@@ -37,21 +41,24 @@ func (rf *Raft) serve() {
 	// all methods beginning with a capital letter
 	// attached to our rf are made avaiable to be
 	// triggered by oncoming network traffic
-	rpc.Register(rf)
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", 8000+rf.id))
+	server := rpc.NewServer() // isolated, not global
+	server.Register(rf)
+	l, err := net.Listen("tcp", fmt.Sprintf(":%d", 8000+rf.id))
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	rf.listener = l
 
 	log.Printf("[Node %d] RPC server started on port %d", rf.id, 8000+rf.id)
 
 	go func() {
 		for {
-			conn, err := listener.Accept()
+			conn, err := rf.listener.Accept()
 			if err != nil {
 				continue
 			}
-			go rpc.ServeConn(conn)
+			go server.ServeConn(conn)
 		}
 	}()
 }

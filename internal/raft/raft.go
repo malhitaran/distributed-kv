@@ -143,6 +143,7 @@ func (rf *Raft) handleVoteReply(reply *RequestVoteReply, votesReceived *int) {
 
 func (rf *Raft) becomeLeader() {
 
+	rf.electionTimer.Stop()
 	log.Printf("[Node %d] Became leader for term %d", rf.id, rf.currentTerm)
 	rf.state = Leader
 
@@ -159,7 +160,7 @@ func (rf *Raft) becomeLeader() {
 // A RPC handler can only take exactly two arguments
 // a pointer to the data(args)
 // a pointer to the response
-func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) error {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -171,7 +172,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// If candidate's term is less than ours, reject
 	if args.Term < rf.currentTerm {
-		return
+		return nil
 	}
 
 	// If candidate's term is greater, update our term
@@ -193,6 +194,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		log.Printf("[Node %d] Granted vote to %d for term %d",
 			rf.id, args.CandidateId, args.Term)
 	}
+	return nil
+	//Gos network library will refuse to attach a requestVote
+	//to the network if the rpc does not have a exact syntax
+
 }
 
 func (rf *Raft) isLogUpToDate(candidateIndex, candidateTerm int) bool {
@@ -216,4 +221,22 @@ func (rf *Raft) getLastLogTerm() int {
 // STUB: Blasts empty AppendEntries to all peers to maintain Leadership
 func (rf *Raft) sendHeartbeats() {
 	// We will write the heartbeat loop here later
+}
+
+// GetState is a test hook to safely read the node's current status
+func (rf *Raft) GetState() NodeState { // (Assuming you named your state type 'State')
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.state
+}
+
+// Stop is a test hook to simulate a hardware failure/crash
+func (rf *Raft) Stop() {
+	if rf.listener != nil {
+		rf.listener.Close() // Cuts the network
+	}
+
+	if rf.electionTimer != nil {
+		rf.electionTimer.Stop() // Kills the zombie background thread!
+	}
 }
