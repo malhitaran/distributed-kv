@@ -1,6 +1,14 @@
-//constructor, allocate a new Raft and initialize fields
+// constructor, allocate a new Raft and initialize fields
 // start the timer
 // return a ready to use node
+package raft
+
+import (
+	"log"
+	"math/rand"
+	"time"
+)
+
 func NewRaft(id int, peers []int) *Raft {
 
 	rf := &Raft{
@@ -198,4 +206,14 @@ func (rf *Raft) isLogUpToDate(candidateIndex, candidateTerm int) bool {
 		(candidateTerm == lastTerm && candidateIndex >= lastIndex)
 }
 
+// stubs to get my test working
+// STUB: Returns the term of the last entry in the log
+func (rf *Raft) getLastLogTerm() int {
+	// For now, just return 0 to satisfy the compiler
+	return 0
+}
 
+// STUB: Blasts empty AppendEntries to all peers to maintain Leadership
+func (rf *Raft) sendHeartbeats() {
+	// We will write the heartbeat loop here later
+}

@@ -11,9 +11,9 @@ type Raft struct {
 	mu sync.Mutex //need a lock for individual nodes
 
 	//node specific info
-	id        int
-	stateNode NodeState
-	peers     []int
+	id    int
+	state NodeState
+	peers []int
 
 	//persistent storage
 	votedFor    int
@@ -28,8 +28,13 @@ type Raft struct {
 	matchIndex map[int]int //highest index known
 	nextIndex  map[int]int //the next guess
 
-	heartBeatTime *time.Time
-	electionTimer *time.Time
+	//channel to send commited entries to KV store
+	applyCh chan LogEntry
+
+	heartBeatTime *time.Timer
+	electionTimer *time.Timer
+	//debugged error here, timer is a stopwatch
+	//time is just a data value of current time
 }
 
 type LogEntry struct {
