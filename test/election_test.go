@@ -20,6 +20,14 @@ func TestElection(t *testing.T) {
 	nodes := make([]*raft.Raft, 3)
 	//this is a list of memory addresses pointing to the actual
 	//structs
+
+	t.Cleanup(func() {
+		for _, node := range nodes {
+			if node != nil {
+				node.Stop()
+			}
+		}
+	})
 	for i := 0; i < 3; i++ {
 		peers := []int{}
 		for j := 0; j < 3; j++ {
@@ -50,8 +58,25 @@ func TestElection(t *testing.T) {
 func TestLeaderFailure(t *testing.T) {
 	// Start 3 nodes
 	nodes := make([]*raft.Raft, 3)
-	// ... (setup like above)
 
+	t.Cleanup(func() {
+		for _, node := range nodes {
+			if node != nil {
+				node.Stop()
+			}
+		}
+	})
+
+	for i := 0; i < 3; i++ {
+		peers := []int{}
+		for j := 0; j < 3; j++ {
+			if i != j {
+				peers = append(peers, j)
+			}
+		}
+		nodes[i] = raft.NewRaft(i, peers)
+		nodes[i].Serve()
+	}
 	// Wait for initial election
 	time.Sleep(1 * time.Second)
 

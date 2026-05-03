@@ -1,10 +1,16 @@
 package raft
 
 import (
+	"encoding/gob" // <--- 1. ADD THIS
 	"log"
 	"math/rand"
 	"time"
 )
+
+// 2. ADD THIS ENTIRE FUNCTION
+func init() {
+	gob.Register(Command{})
+}
 
 // ─── Construction ────────────────────────────────────────────────────────────
 
@@ -18,8 +24,8 @@ func NewRaft(id int, peers []int) *Raft {
 		currentTerm: 0,
 		log:         make([]LogEntry, 0),
 
-		commitIndex: 0,
-		lastApplied: 0,
+		commitIndex: -1,
+		lastApplied: -1,
 
 		applyCh:    make(chan LogEntry, 100),
 		nextIndex:  make(map[int]int),
@@ -42,7 +48,7 @@ func NewRaft(id int, peers []int) *Raft {
 func (rf *Raft) resetElectionTimer() {
 	// 150–300 ms matches the range recommended in the Raft paper.
 	// Randomisation is what makes simultaneous split-votes unlikely.
-	timeout := time.Duration(150+rand.Intn(150)) * time.Millisecond
+	timeout := time.Duration(300+rand.Intn(200)) * time.Millisecond
 
 	if rf.electionTimer != nil {
 		rf.electionTimer.Stop()
@@ -145,7 +151,7 @@ func (rf *Raft) becomeLeader() {
 
 	for _, peer := range rf.peers {
 		rf.nextIndex[peer] = len(rf.log)
-		rf.matchIndex[peer] = 0
+		rf.matchIndex[peer] = -1
 	}
 
 	// Launch the heartbeat goroutine tagged with the current term so that
@@ -163,28 +169,23 @@ func (rf *Raft) becomeLeader() {
 // followers never hear from the leader, their election timers fire, and they
 // start a new election — producing multiple simultaneous leaders.
 func (rf *Raft) heartbeatLoop(term int) {
-	ticker := time.NewTicker(50 * time.Millisecond)
+	ticker := time.NewTicker(30 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-rf.stopCh: //channel to stop heartbeats
+		case <-rf.stopCh:
 			return
 		case <-ticker.C:
 			rf.mu.Lock()
-			// Stop if we are no longer the leader, or no longer in this term.
 			if rf.state != Leader || rf.currentTerm != term {
 				rf.mu.Unlock()
 				return
 			}
-			peers := append([]int{}, rf.peers...) //unpack peers and take a
-			//snapshot and store it in new empty slice
-			leaderID := rf.id
 			rf.mu.Unlock()
 
-			for _, peer := range peers {
-				go rf.sendHeartbeat(peer, term, leaderID)
-			}
+			// Send heartbeats AND replicate log entries
+			rf.replicateToAll() // Changed from sendHeartbeat
 		}
 	}
 }
@@ -227,21 +228,95 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm
 	reply.Success = false
 
-	// Reject messages from stale leaders.
+	// Reject if leader's term is stale
 	if args.Term < rf.currentTerm {
 		return nil
 	}
 
-	// Valid contact from a current or newer leader.
+	// Valid leader - update term if necessary and step down
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 	}
 
 	rf.state = Follower
-	rf.resetElectionTimer() // critical: this is what keeps followers alive
+	rf.resetElectionTimer()
+
+	// === LOG CONSISTENCY CHECK (NEW) ===
+
+	// Check if our log matches at prevLogIndex
+	if args.PrevLogIndex >= 0 {
+		// Our log is too short
+		if args.PrevLogIndex >= len(rf.log) {
+			log.Printf("[Node %d] Log too short: prevIndex=%d, logLen=%d",
+				rf.id, args.PrevLogIndex, len(rf.log))
+			return nil
+		}
+
+		// Term mismatch at prevLogIndex
+		if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+			log.Printf("[Node %d] Term mismatch at index %d: want %d, got %d",
+				rf.id, args.PrevLogIndex, args.PrevLogTerm,
+				rf.log[args.PrevLogIndex].Term)
+
+			// Delete conflicting entry and everything after it
+			rf.log = rf.log[:args.PrevLogIndex]
+			return nil
+		}
+	}
+
+	// Log matches! Append new entries
+	logIndex := args.PrevLogIndex + 1
+
+	for i, entry := range args.Entries {
+		if logIndex+i < len(rf.log) {
+			// Entry exists - check if it matches
+			if rf.log[logIndex+i].Term != entry.Term {
+				// Conflict - delete this and all following entries
+				rf.log = rf.log[:logIndex+i]
+				rf.log = append(rf.log, entry)
+			}
+			// Else: entry already exists and matches, skip it
+			//idempotent
+		} else {
+			// Append new entry
+			rf.log = append(rf.log, entry)
+		}
+	}
+
+	if len(args.Entries) > 0 {
+		log.Printf("[Node %d] Appended %d entries, log now has %d entries",
+			rf.id, len(args.Entries), len(rf.log))
+	}
+
+	// Update commit index
+
+	if args.LeaderCommit > rf.commitIndex {
+		// Calculate the new commit first
+		newCommit := min(args.LeaderCommit, len(rf.log)-1)
+
+		// Explicit guard: NEVER go backwards
+		if newCommit > rf.commitIndex {
+			oldCommit := rf.commitIndex
+			rf.commitIndex = newCommit
+
+			log.Printf("[Node %d] Advanced commitIndex from %d to %d",
+				rf.id, oldCommit, rf.commitIndex)
+
+			rf.applyCommittedEntries()
+		}
+	}
+
 	reply.Success = true
 	return nil
+}
+
+// Helper function
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // RequestVote handles incoming RequestVote RPCs.
@@ -429,6 +504,89 @@ func (rf *Raft) replicateToPeer(peer, term, leaderID, leaderCommit int) {
 			rf.nextIndex[peer]--
 		}
 		// Immediately retry with the decremented index
-		go rf.replicateToPeer(peer, term, leaderID, leaderCommit)
+		go rf.replicateToPeer(peer, term, leaderID, rf.commitIndex)
 	}
+}
+
+// updateCommitIndex checks if a majority of nodes have replicated an entry,
+// and if so, advances the commit index.
+//
+// From the Raft paper (§5.3):
+//
+//	"If there exists an N such that N > commitIndex, a majority of
+//	 matchIndex[i] ≥ N, and log[N].term == currentTerm: set commitIndex = N"
+//
+// Must be called while holding rf.mu.
+func (rf *Raft) updateCommitIndex() {
+	// Try each index from commitIndex+1 to the end of our log
+	for n := rf.commitIndex + 1; n < len(rf.log); n++ {
+		// Only commit entries from our current term (safety property)
+		if rf.log[n].Term != rf.currentTerm {
+			continue
+		}
+
+		// Count how many nodes have this entry
+		replicaCount := 1 // Count ourselves
+		for peer := range rf.matchIndex {
+			if rf.matchIndex[peer] >= n {
+				replicaCount++
+			}
+		}
+
+		// Check if we have a majority
+		majority := (len(rf.peers)+1)/2 + 1
+		if replicaCount >= majority {
+			// We can commit this entry!
+			oldCommit := rf.commitIndex
+			rf.commitIndex = n
+
+			log.Printf("[Node %d] Advanced commitIndex from %d to %d (replicated on %d/%d nodes)",
+				rf.id, oldCommit, n, replicaCount, len(rf.peers)+1)
+
+			// Apply newly committed entries
+			rf.applyCommittedEntries()
+		}
+	}
+}
+
+// applyCommittedEntries sends all entries between lastApplied and commitIndex
+// to the applyCh channel, where the KV store will consume them.
+//
+// Must be called while holding rf.mu.
+func (rf *Raft) applyCommittedEntries() {
+	for rf.lastApplied < rf.commitIndex {
+		rf.lastApplied++
+		entry := rf.log[rf.lastApplied]
+
+		log.Printf("[Node %d] Applying entry at index %d: %+v",
+			rf.id, rf.lastApplied, entry.Command)
+
+		// Send to KV store (non-blocking send)
+		select {
+		case rf.applyCh <- entry:
+			// Sent successfully
+		default:
+			// Channel full - this should never happen with a buffer of 100
+			log.Printf("[Node %d] WARNING: applyCh is full!", rf.id)
+		}
+	}
+}
+
+// GetApplyCh returns the channel where committed entries appear.
+// The KV store will read from this channel in Phase 3.
+func (rf *Raft) GetApplyCh() <-chan LogEntry {
+	return rf.applyCh
+}
+
+func (rf *Raft) GetLogLength() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return len(rf.log)
+}
+
+// Add to raft.go:
+func (rf *Raft) GetCommitIndex() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.commitIndex
 }
