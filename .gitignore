@@ -7,9 +7,6 @@ plot.gp
 targets.json
 targets.txt
 
-# Private files
-changes.txt
-
 # macOS
 .DS_Store
 .AppleDouble
