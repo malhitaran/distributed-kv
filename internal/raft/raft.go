@@ -28,7 +28,10 @@ func NewRaft(id int, peers []int) *Raft {
 		stopCh: make(chan struct{}), // buffered is not needed; close() is the signal
 	}
 
+	rf.mu.Lock()
 	rf.resetElectionTimer()
+	rf.mu.Unlock()
+
 	return rf
 }
 
@@ -81,7 +84,8 @@ func (rf *Raft) startElection() {
 	// votes is a shared counter, but it is always accessed while holding
 	// rf.mu, so no atomic operations are needed.
 	votes := 1
-	majority := len(peers)/2 + 1 // e.g. 2 for a 3-node cluster
+	clusterSize := len(peers) + 1
+	majority := clusterSize/2 + 1
 
 	for _, peer := range peers {
 		go func(p int) {
@@ -164,7 +168,7 @@ func (rf *Raft) heartbeatLoop(term int) {
 
 	for {
 		select {
-		case <-rf.stopCh:
+		case <-rf.stopCh: //channel to stop heartbeats
 			return
 		case <-ticker.C:
 			rf.mu.Lock()
@@ -173,7 +177,8 @@ func (rf *Raft) heartbeatLoop(term int) {
 				rf.mu.Unlock()
 				return
 			}
-			peers := append([]int{}, rf.peers...)
+			peers := append([]int{}, rf.peers...) //unpack peers and take a
+			//snapshot and store it in new empty slice
 			leaderID := rf.id
 			rf.mu.Unlock()
 
@@ -207,6 +212,7 @@ func (rf *Raft) sendHeartbeat(peer, term, leaderID int) {
 		rf.votedFor = -1
 		rf.resetElectionTimer()
 	}
+
 }
 
 // ─── RPC handlers ─────────────────────────────────────────────────────────────
@@ -306,21 +312,23 @@ func (rf *Raft) GetState() NodeState {
 //   - kills the election timer
 //   - closes the network listener
 func (rf *Raft) Stop() {
-	// Flip to Follower before anything else so that GetState() called
-	// concurrently never sees a stale Leader on a stopped node.
 	rf.mu.Lock()
-	rf.state = Follower
-	rf.mu.Unlock()
+	defer rf.mu.Unlock() // Keep the door locked until the entire shutdown is finished
 
-	// stopOnce prevents a double-close panic if Stop() is called twice
-	// (the test cleanup functions do exactly this).
+	// 1. Force state to Follower
+	rf.state = Follower
+
+	// 2. Kill the timer WHILE the door is locked (Fixes the zombie bug)
+	if rf.electionTimer != nil {
+		rf.electionTimer.Stop()
+	}
+
+	// 3. Trigger the kill switch for background threads
 	rf.stopOnce.Do(func() {
 		close(rf.stopCh)
 	})
 
-	if rf.electionTimer != nil {
-		rf.electionTimer.Stop()
-	}
+	// 4. Cut the network
 	if rf.listener != nil {
 		rf.listener.Close()
 	}
