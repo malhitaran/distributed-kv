@@ -39,3 +39,4 @@ Icon
 *.dylib
 *.test
 *.out
+results.bin
