@@ -4,7 +4,7 @@ High-performance distributed key-value store implementing Raft consensus.
 
 ## Status
 - [x] Project setup
-- [ ] Leader election
+- [x] Leader election
 - [ ] Log replication
 - [ ] KV storage integration
 - [ ] Benchmarking
