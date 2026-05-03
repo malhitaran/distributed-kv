@@ -94,15 +94,14 @@ func (kv *KVStore) Put(key string, value interface{}) error {
 		Value: value,
 	}
 
+	kv.mu.Lock()
 	index, _, isLeader := kv.raft.Propose(cmd)
 	if !isLeader {
+		kv.mu.Unlock()
 		return ErrNotLeader
 	}
 
-	// Wait for commit
 	resultCh := make(chan Result, 1)
-
-	kv.mu.Lock()
 	kv.notifyCh[index] = resultCh
 	kv.mu.Unlock()
 
@@ -133,14 +132,14 @@ func (kv *KVStore) Delete(key string) error {
 		Key: key,
 	}
 
+	kv.mu.Lock()
 	index, _, isLeader := kv.raft.Propose(cmd)
 	if !isLeader {
+		kv.mu.Unlock()
 		return ErrNotLeader
 	}
 
 	resultCh := make(chan Result, 1)
-
-	kv.mu.Lock()
 	kv.notifyCh[index] = resultCh
 	kv.mu.Unlock()
 

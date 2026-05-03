@@ -557,6 +557,7 @@ func (rf *Raft) applyCommittedEntries() {
 	for rf.lastApplied < rf.commitIndex {
 		rf.lastApplied++
 		entry := rf.log[rf.lastApplied]
+		entry.Index = rf.lastApplied // Guarantee Index is correct for KV store
 
 		log.Printf("[Node %d] Applying entry at index %d: %+v",
 			rf.id, rf.lastApplied, entry.Command)

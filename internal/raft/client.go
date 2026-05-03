@@ -28,6 +28,7 @@ func (rf *Raft) Propose(cmd Command) (index int, term int, isLeader bool) {
 	// Append to our log
 	entry := LogEntry{
 		Term:    rf.currentTerm,
+		Index:   len(rf.log),
 		Command: cmd,
 	}
 	rf.log = append(rf.log, entry)
