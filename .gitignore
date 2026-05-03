@@ -1,8 +1,41 @@
+# Build and Test Artifacts
+bin/
 results-*.bin
 latencies.csv
 latency-distribution.png
 plot.gp
 targets.json
 targets.txt
-bin/
+
+# Private files
 changes.txt
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Go artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
