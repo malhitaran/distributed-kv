@@ -11,6 +11,8 @@ High-performance distributed key-value store implementing the Raft consensus alg
 - **HTTP API** - Simple REST interface
 
 ## Architecture
+
+```text
 ┌─────────────────────────────────────┐
 │         Client Requests              │
 └──────────────┬──────────────────────┘
@@ -34,6 +36,7 @@ High-performance distributed key-value store implementing the Raft consensus alg
 │
 ▼
 Network (RPC to peers)
+```
 
 ## Quick Start
 
