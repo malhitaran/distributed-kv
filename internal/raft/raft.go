@@ -2,7 +2,6 @@ package raft
 
 import (
 	"encoding/gob" // <--- 1. ADD THIS
-	"log"
 	"math/rand"
 	"time"
 )
@@ -27,11 +26,13 @@ func NewRaft(id int, peers []int) *Raft {
 		commitIndex: -1,
 		lastApplied: -1,
 
-		applyCh:    make(chan LogEntry, 100),
+		applyCh:    make(chan CommitEntry, 100),
 		nextIndex:  make(map[int]int),
 		matchIndex: make(map[int]int),
 
 		stopCh: make(chan struct{}), // buffered is not needed; close() is the signal
+
+		pendingReplication: false,
 	}
 
 	rf.mu.Lock()
@@ -85,7 +86,7 @@ func (rf *Raft) startElection() {
 	rf.resetElectionTimer()
 	rf.mu.Unlock()
 
-	log.Printf("[Node %d] Starting election for term %d", id, term)
+	logDebug("[Node %d] Starting election for term %d", id, term)
 
 	// votes is a shared counter, but it is always accessed while holding
 	// rf.mu, so no atomic operations are needed.
@@ -147,7 +148,7 @@ func (rf *Raft) becomeLeader() {
 	rf.electionTimer.Stop()
 
 	rf.state = Leader
-	log.Printf("[Node %d] Became leader for term %d", rf.id, rf.currentTerm)
+	logDebug("[Node %d] Became leader for term %d", rf.id, rf.currentTerm)
 
 	for _, peer := range rf.peers {
 		rf.nextIndex[peer] = len(rf.log)
@@ -169,7 +170,7 @@ func (rf *Raft) becomeLeader() {
 // followers never hear from the leader, their election timers fire, and they
 // start a new election — producing multiple simultaneous leaders.
 func (rf *Raft) heartbeatLoop(term int) {
-	ticker := time.NewTicker(30 * time.Millisecond)
+	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
@@ -248,14 +249,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.PrevLogIndex >= 0 {
 		// Our log is too short
 		if args.PrevLogIndex >= len(rf.log) {
-			log.Printf("[Node %d] Log too short: prevIndex=%d, logLen=%d",
+			logDebug("[Node %d] Log too short: prevIndex=%d, logLen=%d",
 				rf.id, args.PrevLogIndex, len(rf.log))
 			return nil
 		}
 
 		// Term mismatch at prevLogIndex
 		if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-			log.Printf("[Node %d] Term mismatch at index %d: want %d, got %d",
+			logDebug("[Node %d] Term mismatch at index %d: want %d, got %d",
 				rf.id, args.PrevLogIndex, args.PrevLogTerm,
 				rf.log[args.PrevLogIndex].Term)
 
@@ -285,7 +286,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	if len(args.Entries) > 0 {
-		log.Printf("[Node %d] Appended %d entries, log now has %d entries",
+		logDebug("[Node %d] Appended %d entries, log now has %d entries",
 			rf.id, len(args.Entries), len(rf.log))
 	}
 
@@ -300,7 +301,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			oldCommit := rf.commitIndex
 			rf.commitIndex = newCommit
 
-			log.Printf("[Node %d] Advanced commitIndex from %d to %d",
+			logDebug("[Node %d] Advanced commitIndex from %d to %d",
 				rf.id, oldCommit, rf.commitIndex)
 
 			rf.applyCommittedEntries()
@@ -325,7 +326,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) erro
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	log.Printf("[Node %d] Received RequestVote from %d for term %d",
+	logDebug("[Node %d] Received RequestVote from %d for term %d",
 		rf.id, args.CandidateId, args.Term)
 
 	reply.Term = rf.currentTerm
@@ -352,7 +353,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) erro
 		reply.VoteGranted = true
 		rf.resetElectionTimer()
 
-		log.Printf("[Node %d] Granted vote to %d for term %d",
+		logDebug("[Node %d] Granted vote to %d for term %d",
 			rf.id, args.CandidateId, args.Term)
 	}
 
@@ -540,7 +541,7 @@ func (rf *Raft) updateCommitIndex() {
 			oldCommit := rf.commitIndex
 			rf.commitIndex = n
 
-			log.Printf("[Node %d] Advanced commitIndex from %d to %d (replicated on %d/%d nodes)",
+			logDebug("[Node %d] Advanced commitIndex from %d to %d (replicated on %d/%d nodes)",
 				rf.id, oldCommit, n, replicaCount, len(rf.peers)+1)
 
 			// Apply newly committed entries
@@ -557,25 +558,29 @@ func (rf *Raft) applyCommittedEntries() {
 	for rf.lastApplied < rf.commitIndex {
 		rf.lastApplied++
 		entry := rf.log[rf.lastApplied]
-		entry.Index = rf.lastApplied // Guarantee Index is correct for KV store
 
-		log.Printf("[Node %d] Applying entry at index %d: %+v",
+		logDebug("[Node %d] Applying entry at index %d: %+v",
 			rf.id, rf.lastApplied, entry.Command)
 
 		// Send to KV store (non-blocking send)
+		commitMsg := CommitEntry{
+			Index: rf.lastApplied,
+			Entry: entry,
+		}
+
 		select {
-		case rf.applyCh <- entry:
+		case rf.applyCh <- commitMsg:
 			// Sent successfully
 		default:
 			// Channel full - this should never happen with a buffer of 100
-			log.Printf("[Node %d] WARNING: applyCh is full!", rf.id)
+			logWarn("[Node %d] WARNING: applyCh is full!", rf.id)
 		}
 	}
 }
 
 // GetApplyCh returns the channel where committed entries appear.
 // The KV store will read from this channel in Phase 3.
-func (rf *Raft) GetApplyCh() <-chan LogEntry {
+func (rf *Raft) GetApplyCh() <-chan CommitEntry {
 	return rf.applyCh
 }
 

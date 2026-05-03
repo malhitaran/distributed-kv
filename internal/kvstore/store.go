@@ -4,6 +4,7 @@ import (
 	"errors"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/malhitaran/distributed-kv/internal/raft"
 )
@@ -40,10 +41,10 @@ func NewKVStore(rf *raft.Raft) *KVStore {
 func (kv *KVStore) applyLoop() {
 	applyCh := kv.raft.GetApplyCh()
 
-	for entry := range applyCh {
-		cmd, ok := entry.Command.(raft.Command)
+	for commitMsg := range applyCh {
+		cmd, ok := commitMsg.Entry.Command.(raft.Command)
 		if !ok {
-			log.Printf("Invalid command type: %T", entry.Command)
+			log.Printf("Invalid command type: %T", commitMsg.Entry.Command)
 			continue
 		}
 
@@ -73,13 +74,13 @@ func (kv *KVStore) applyLoop() {
 			delete(kv.data, cmd.Key)
 			result.Value = nil
 			result.Err = nil
-			log.Printf("[KVStore] DELETE %s", cmd.Key)
+			// log.Printf("[KVStore] DELETE %s", cmd.Key)
 		}
 
 		// Notify waiting client
-		if ch, exists := kv.notifyCh[entry.Index]; exists {
+		if ch, exists := kv.notifyCh[commitMsg.Index]; exists {
 			ch <- result
-			delete(kv.notifyCh, entry.Index)
+			delete(kv.notifyCh, commitMsg.Index)
 		}
 
 		kv.mu.Unlock()
@@ -105,8 +106,15 @@ func (kv *KVStore) Put(key string, value interface{}) error {
 	kv.notifyCh[index] = resultCh
 	kv.mu.Unlock()
 
-	result := <-resultCh
-	return result.Err
+	select {
+	case result := <-resultCh:
+		return result.Err
+	case <-time.After(2 * time.Second):
+		kv.mu.Lock()
+		delete(kv.notifyCh, index)
+		kv.mu.Unlock()
+		return errors.New("timeout waiting for commit")
+	}
 }
 
 // Get retrieves a value by key
@@ -143,8 +151,15 @@ func (kv *KVStore) Delete(key string) error {
 	kv.notifyCh[index] = resultCh
 	kv.mu.Unlock()
 
-	result := <-resultCh
-	return result.Err
+	select {
+	case result := <-resultCh:
+		return result.Err
+	case <-time.After(2 * time.Second):
+		kv.mu.Lock()
+		delete(kv.notifyCh, index)
+		kv.mu.Unlock()
+		return errors.New("timeout waiting for commit")
+	}
 }
 
 var (

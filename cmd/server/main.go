@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -10,9 +9,12 @@ import (
 	"strings"
 	"time"
 
+	jsoniter "github.com/json-iterator/go"
 	"github.com/malhitaran/distributed-kv/internal/kvstore"
 	"github.com/malhitaran/distributed-kv/internal/raft"
 )
+
+var json = jsoniter.ConfigCompatibleWithStandardLibrary
 
 type Server struct {
 	kv   *kvstore.KVStore

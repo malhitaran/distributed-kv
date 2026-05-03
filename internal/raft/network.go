@@ -5,6 +5,12 @@ import (
 	"log"
 	"net"
 	"net/rpc"
+	"sync"
+)
+
+var (
+	clientPool = make(map[int]*rpc.Client)
+	poolMu     sync.Mutex
 )
 
 // Serve starts an isolated RPC server for this node on port 8000+id.
@@ -40,7 +46,7 @@ func (rf *Raft) Serve() {
 	}
 	rf.listener = l
 
-	log.Printf("[Node %d] RPC server started on port %d", rf.id, 8000+rf.id)
+	logDebug("[Node %d] RPC server started on port %d", rf.id, 8000+rf.id)
 
 	go func() {
 		for {
@@ -56,24 +62,39 @@ func (rf *Raft) Serve() {
 	}()
 }
 
+func (rf *Raft) getClient(peer int) (*rpc.Client, error) {
+	poolMu.Lock()
+	defer poolMu.Unlock()
+
+	if client, exists := clientPool[peer]; exists {
+		return client, nil
+	}
+
+	client, err := rpc.Dial("tcp", fmt.Sprintf("localhost:%d", 8000+peer))
+	if err != nil {
+		return nil, err
+	}
+
+	clientPool[peer] = client
+	return client, nil
+}
+
 // callRequestVote dials peer and invokes the RequestVote RPC.
 // Returns false on any network or RPC error (treated as "no vote").
 func (rf *Raft) callRequestVote(peer int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	client, err := rpc.Dial("tcp", fmt.Sprintf("localhost:%d", 8000+peer))
+	client, err := rf.getClient(peer)
 	if err != nil {
 		return false
 	}
-	defer client.Close()
 	return client.Call("Raft.RequestVote", args, reply) == nil
 }
 
 // callAppendEntries dials peer and invokes the AppendEntries RPC.
 // Returns false on any network or RPC error.
 func (rf *Raft) callAppendEntries(peer int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	client, err := rpc.Dial("tcp", fmt.Sprintf("localhost:%d", 8000+peer))
+	client, err := rf.getClient(peer)
 	if err != nil {
 		return false
 	}
-	defer client.Close()
 	return client.Call("Raft.AppendEntries", args, reply) == nil
 }

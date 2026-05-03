@@ -31,7 +31,11 @@ type Raft struct {
 	nextIndex  map[int]int
 
 	// Channel to forward committed entries to the KV layer (Phase 3)
-	applyCh chan LogEntry
+	applyCh chan CommitEntry
+
+	// Batching
+	pendingReplication bool
+	replicationTimer   *time.Timer
 
 	electionTimer *time.Timer
 	// Note: no heartbeatTimer field — the heartbeat is driven by a
@@ -41,8 +45,13 @@ type Raft struct {
 
 type LogEntry struct {
 	Term    int
-	Index   int
 	Command interface{}
+}
+
+// CommitEntry wraps a log entry with its committed index for the state machine
+type CommitEntry struct {
+	Index int
+	Entry LogEntry
 }
 
 type NodeState int

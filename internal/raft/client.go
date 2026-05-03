@@ -1,6 +1,6 @@
 package raft
 
-import "log"
+import "time"
 
 // Command represents a client operation (e.g., PUT/GET/DELETE)
 type Command struct {
@@ -28,7 +28,6 @@ func (rf *Raft) Propose(cmd Command) (index int, term int, isLeader bool) {
 	// Append to our log
 	entry := LogEntry{
 		Term:    rf.currentTerm,
-		Index:   len(rf.log),
 		Command: cmd,
 	}
 	rf.log = append(rf.log, entry)
@@ -36,11 +35,19 @@ func (rf *Raft) Propose(cmd Command) (index int, term int, isLeader bool) {
 	index = len(rf.log) - 1
 	term = rf.currentTerm
 
-	log.Printf("[Node %d] Accepted command %+v at index %d, term %d",
+	logDebug("[Node %d] Accepted command %+v at index %d, term %d",
 		rf.id, cmd, index, term)
 
-	// Trigger immediate replication (don't wait for next heartbeat)
-	go rf.replicateToAll()
+	// Schedule batched replication (5ms window)
+	if !rf.pendingReplication {
+		rf.pendingReplication = true
+		rf.replicationTimer = time.AfterFunc(5*time.Millisecond, func() {
+			rf.mu.Lock()
+			rf.pendingReplication = false
+			rf.mu.Unlock()
+			rf.replicateToAll()
+		})
+	}
 
 	return index, term, true
 	//we need to return these items for three reasons
