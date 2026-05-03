@@ -333,3 +333,102 @@ func (rf *Raft) Stop() {
 		rf.listener.Close()
 	}
 }
+
+// replicateToAll sends the latest log entries to all peers.
+// Called when a new command is proposed, or periodically by the heartbeat loop.
+func (rf *Raft) replicateToAll() {
+	rf.mu.Lock()
+
+	if rf.state != Leader {
+		rf.mu.Unlock()
+		return
+	}
+
+	term := rf.currentTerm
+	leaderID := rf.id
+	leaderCommit := rf.commitIndex
+	peers := append([]int{}, rf.peers...)
+
+	rf.mu.Unlock()
+
+	for _, peer := range peers {
+		go rf.replicateToPeer(peer, term, leaderID, leaderCommit)
+	}
+}
+
+// replicateToPeer sends log entries to a single follower.
+func (rf *Raft) replicateToPeer(peer, term, leaderID, leaderCommit int) {
+	rf.mu.Lock()
+
+	// Double-check we're still the leader
+	if rf.state != Leader || rf.currentTerm != term {
+		rf.mu.Unlock()
+		return
+	}
+
+	// Get the next index to send to this peer
+	nextIdx := rf.nextIndex[peer]
+
+	// Build the AppendEntries args
+	prevLogIndex := nextIdx - 1
+	prevLogTerm := 0
+	if prevLogIndex >= 0 && prevLogIndex < len(rf.log) {
+		prevLogTerm = rf.log[prevLogIndex].Term
+	}
+
+	// Entries to send: everything from nextIdx onward
+	entries := []LogEntry{}
+	if nextIdx < len(rf.log) {
+		entries = append(entries, rf.log[nextIdx:]...)
+	}
+
+	rf.mu.Unlock()
+
+	args := AppendEntriesArgs{
+		Term:         term,
+		LeaderId:     leaderID,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+		Entries:      entries,
+		LeaderCommit: leaderCommit,
+	}
+
+	reply := AppendEntriesReply{}
+
+	if !rf.callAppendEntries(peer, &args, &reply) {
+		return // Network failure
+	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// If peer's term is higher, step down
+	if reply.Term > rf.currentTerm {
+		rf.currentTerm = reply.Term
+		rf.state = Follower
+		rf.votedFor = -1
+		rf.resetElectionTimer()
+		return
+	}
+
+	// Stale reply (we've moved on)
+	if rf.state != Leader || rf.currentTerm != term {
+		return
+	}
+
+	if reply.Success {
+		// Peer accepted the entries!
+		rf.nextIndex[peer] = nextIdx + len(entries)
+		rf.matchIndex[peer] = rf.nextIndex[peer] - 1
+
+		// Check if we can advance commitIndex
+		rf.updateCommitIndex()
+	} else {
+		// Peer's log doesn't match - decrement nextIndex and retry
+		if rf.nextIndex[peer] > 0 {
+			rf.nextIndex[peer]--
+		}
+		// Immediately retry with the decremented index
+		go rf.replicateToPeer(peer, term, leaderID, leaderCommit)
+	}
+}
